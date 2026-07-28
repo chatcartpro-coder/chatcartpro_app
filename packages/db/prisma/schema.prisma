@@ -1,0 +1,466 @@
+generator client {
+  provider        = "prisma-client-js"
+  previewFeatures = ["postgresqlExtensions"]
+}
+
+datasource db {
+  provider   = "postgresql"
+  url        = env("DATABASE_URL")
+  extensions = [vector]
+}
+
+// ---------- Enums ----------
+
+enum Vertical {
+  restaurant
+  salon
+  real_estate
+  gym
+  dental_clinic
+  pharmacy
+  auto_repair
+  event_venue
+  courier_logistics
+  grocery_store
+  laundry
+  car_rental
+  hospital_clinic
+  other
+}
+
+enum UserRole {
+  owner
+  admin
+  agent
+  read_only
+}
+
+enum OptInStatus {
+  opted_in
+  opted_out
+  pending
+  unknown
+}
+
+enum TemplateCategory {
+  marketing
+  utility
+  authentication
+}
+
+enum TemplateStatus {
+  draft
+  pending_review
+  approved
+  rejected
+  paused
+  disabled
+}
+
+enum CampaignStatus {
+  draft
+  scheduled
+  sending
+  completed
+  failed
+  cancelled
+}
+
+enum RecipientStatus {
+  pending
+  sent
+  delivered
+  read
+  failed
+}
+
+enum MessageDirection {
+  inbound
+  outbound
+}
+
+enum MessageStatus {
+  queued
+  sent
+  delivered
+  read
+  failed
+}
+
+enum EscalationStatus {
+  pending_classification
+  pending_send
+  sent
+  delivered
+  read
+  reminder_sent
+  rep_replied
+  resolved
+  expired
+}
+
+// ---------- Core tenancy ----------
+
+model Tenant {
+  id        String   @id @default(cuid())
+  name      String
+  vertical  Vertical @default(other)
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  users            User[]
+  wabaConnections  WabaConnection[]
+  contacts         Contact[]
+  contactSegments  ContactSegment[]
+  templates        Template[]
+  campaigns        Campaign[]
+  conversations    Conversation[]
+  automations      Automation[]
+  kbDocuments      KbDocument[]
+  productFeedItems ProductFeedItem[]
+  escalations      Escalation[]
+  auditLogs        AuditLog[]
+  plan             Plan?
+
+  @@map("tenants")
+}
+
+model User {
+  id             String   @id @default(cuid())
+  tenantId       String
+  supabaseUserId String   @unique // maps 1:1 to Supabase auth.users.id (JWT `sub` claim)
+  email          String
+  name           String?
+  role           UserRole @default(agent)
+  createdAt      DateTime @default(now())
+  updatedAt      DateTime @updatedAt
+
+  tenant             Tenant       @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  assignedEscalations Escalation[] @relation("AssignedRep")
+
+  @@unique([tenantId, email])
+  @@map("users")
+}
+
+// ---------- WhatsApp connection ----------
+
+model WabaConnection {
+  id                  String   @id @default(cuid())
+  tenantId            String
+  phoneNumberId       String   @unique
+  wabaId              String
+  displayName         String?
+  qualityRating       String? // GREEN / YELLOW / RED from Meta
+  messagingLimitTier  String? // e.g. "1K", "10K", "100K", "UNLIMITED"
+  accessTokenEnc      String // encrypted long-lived system user token
+  connectedAt         DateTime @default(now())
+  createdAt           DateTime @default(now())
+  updatedAt           DateTime @updatedAt
+
+  tenant Tenant @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+
+  @@map("waba_connections")
+}
+
+// ---------- Contacts ----------
+
+model Contact {
+  id          String      @id @default(cuid())
+  tenantId    String
+  phone       String
+  name        String?
+  optInStatus OptInStatus @default(unknown)
+  tags        String[]    @default([])
+  leadScore   Int? // 0-100, populated by async AI enrichment
+  sentiment   String? // positive / neutral / negative, latest observed
+  createdAt   DateTime    @default(now())
+  updatedAt   DateTime    @updatedAt
+
+  tenant             Tenant               @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  conversations       Conversation[]
+  campaignRecipients  CampaignRecipient[]
+  escalations         Escalation[]
+  segments            ContactSegmentMember[]
+
+  @@unique([tenantId, phone])
+  @@map("contacts")
+}
+
+model ContactSegment {
+  id          String   @id @default(cuid())
+  tenantId    String
+  name        String
+  description String?
+  isDynamic   Boolean  @default(false) // true = AI/rule-computed membership
+  createdAt   DateTime @default(now())
+
+  tenant  Tenant                 @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  members ContactSegmentMember[]
+
+  @@map("contact_segments")
+}
+
+model ContactSegmentMember {
+  segmentId String
+  contactId String
+  addedAt   DateTime @default(now())
+
+  segment ContactSegment @relation(fields: [segmentId], references: [id], onDelete: Cascade)
+  contact Contact        @relation(fields: [contactId], references: [id], onDelete: Cascade)
+
+  @@id([segmentId, contactId])
+  @@map("contact_segment_members")
+}
+
+// ---------- Templates & Campaigns ----------
+
+model Template {
+  id             String           @id @default(cuid())
+  tenantId       String
+  name           String
+  category       TemplateCategory
+  status         TemplateStatus   @default(draft)
+  metaTemplateId String?
+  language       String           @default("en")
+  bodyText       String
+  aiGenerated    Boolean          @default(false)
+  vertical       Vertical?
+  createdAt      DateTime         @default(now())
+  updatedAt      DateTime         @updatedAt
+
+  tenant    Tenant     @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  campaigns Campaign[]
+
+  @@unique([tenantId, name, language])
+  @@map("templates")
+}
+
+model Campaign {
+  id          String         @id @default(cuid())
+  tenantId    String
+  templateId  String?
+  name        String
+  status      CampaignStatus @default(draft)
+  scheduledAt DateTime?
+  sentCount   Int            @default(0)
+  deliveredCount Int         @default(0)
+  readCount   Int            @default(0)
+  failedCount Int            @default(0)
+  createdAt   DateTime       @default(now())
+  updatedAt   DateTime       @updatedAt
+
+  tenant     Tenant              @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  template   Template?           @relation(fields: [templateId], references: [id])
+  recipients CampaignRecipient[]
+
+  @@map("campaigns")
+}
+
+model CampaignRecipient {
+  id          String          @id @default(cuid())
+  campaignId  String
+  contactId   String
+  status      RecipientStatus @default(pending)
+  sentAt      DateTime?
+  deliveredAt DateTime?
+  readAt      DateTime?
+  failedAt    DateTime?
+  failReason  String?
+
+  campaign Campaign @relation(fields: [campaignId], references: [id], onDelete: Cascade)
+  contact  Contact  @relation(fields: [contactId], references: [id], onDelete: Cascade)
+
+  @@unique([campaignId, contactId])
+  @@map("campaign_recipients")
+}
+
+// ---------- Conversations & Messages ----------
+
+model Conversation {
+  id             String    @id @default(cuid())
+  tenantId       String
+  contactId      String
+  windowExpiresAt DateTime? // 24h customer-service window per Meta rules
+  aiCopilotMode  String    @default("off") // off | draft_and_approve | full_auto
+  createdAt      DateTime  @default(now())
+  updatedAt      DateTime  @updatedAt
+
+  tenant      Tenant       @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  contact     Contact      @relation(fields: [contactId], references: [id], onDelete: Cascade)
+  messages    Message[]
+  escalations Escalation[]
+
+  @@unique([tenantId, contactId])
+  @@map("conversations")
+}
+
+model Message {
+  id             String            @id @default(cuid())
+  conversationId String
+  direction      MessageDirection
+  status         MessageStatus     @default(queued)
+  body           String
+  metaMessageId  String?           @unique
+  aiGenerated    Boolean           @default(false)
+  sentAt         DateTime?
+  deliveredAt    DateTime?
+  readAt         DateTime?
+  createdAt      DateTime          @default(now())
+
+  conversation Conversation @relation(fields: [conversationId], references: [id], onDelete: Cascade)
+
+  @@map("messages")
+}
+
+// ---------- Automations ----------
+
+model Automation {
+  id          String   @id @default(cuid())
+  tenantId    String
+  name        String
+  isActive    Boolean  @default(true)
+  triggerType String // e.g. "keyword", "no_reply_timeout", "new_contact"
+  config      Json
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  tenant Tenant @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+
+  @@map("automations")
+}
+
+// ---------- Knowledge base (RAG) ----------
+
+model KbDocument {
+  id        String   @id @default(cuid())
+  tenantId  String
+  title     String
+  sourceUrl String?
+  status    String   @default("pending") // pending | ingested | failed
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  tenant Tenant     @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  chunks KbChunk[]
+
+  @@map("kb_documents")
+}
+
+model KbChunk {
+  id         String                 @id @default(cuid())
+  documentId String
+  content    String
+  embedding  Unsupported("vector(1536)")?
+  createdAt  DateTime               @default(now())
+
+  document KbDocument @relation(fields: [documentId], references: [id], onDelete: Cascade)
+
+  @@map("kb_chunks")
+}
+
+// ---------- Product feed ----------
+
+model ProductFeedItem {
+  id          String   @id @default(cuid())
+  tenantId    String
+  sku         String?
+  name        String
+  description String?
+  price       Decimal? @db.Decimal(10, 2)
+  currency    String   @default("USD")
+  stock       Int?
+  attributes  Json? // vertical-flexible: menu item, listing, appointment slot, etc.
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  tenant Tenant @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+
+  @@map("product_feed_items")
+}
+
+// ---------- Lead escalation (flagship) ----------
+
+model Escalation {
+  id               String           @id @default(cuid())
+  tenantId         String
+  contactId        String
+  conversationId   String
+  assignedRepId    String?
+  status           EscalationStatus @default(pending_classification)
+  intent           String?
+  confidence       Float?
+  repMessageId     String? // message id of the outbound rep-facing notification
+  deliveredAt      DateTime?
+  readAt           DateTime?
+  repRepliedAt     DateTime?
+  reminderCount    Int              @default(0)
+  maxReminders     Int              @default(3)
+  createdAt        DateTime         @default(now())
+  updatedAt        DateTime         @updatedAt
+
+  tenant       Tenant        @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  contact      Contact       @relation(fields: [contactId], references: [id], onDelete: Cascade)
+  conversation Conversation  @relation(fields: [conversationId], references: [id], onDelete: Cascade)
+  assignedRep  User?         @relation("AssignedRep", fields: [assignedRepId], references: [id])
+  events       EscalationEvent[]
+
+  @@map("escalations")
+}
+
+model EscalationEvent {
+  id           String   @id @default(cuid())
+  escalationId String
+  fromStatus   EscalationStatus?
+  toStatus     EscalationStatus
+  note         String?
+  createdAt    DateTime @default(now())
+
+  escalation Escalation @relation(fields: [escalationId], references: [id], onDelete: Cascade)
+
+  @@map("escalation_events")
+}
+
+// ---------- Observability / billing / audit ----------
+
+model AiClassification {
+  id           String   @id @default(cuid())
+  tenantId     String
+  kind         String // e.g. "intent_classification", "lead_scoring", "campaign_copy"
+  model        String
+  inputTokens  Int?
+  outputTokens Int?
+  latencyMs    Int?
+  createdAt    DateTime @default(now())
+
+  @@map("ai_classifications")
+}
+
+model Plan {
+  id                String   @id @default(cuid())
+  tenantId          String   @unique
+  tierName          String   @default("starter") // starter | growth | pro | scale
+  contactLimit      Int      @default(1000)
+  messageLimit      Int      @default(5000)
+  wabaNumberLimit    Int     @default(1)
+  currentPeriodStart DateTime @default(now())
+  currentPeriodEnd   DateTime?
+  createdAt         DateTime @default(now())
+  updatedAt         DateTime @updatedAt
+
+  tenant Tenant @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+
+  @@map("plans")
+}
+
+model AuditLog {
+  id        String   @id @default(cuid())
+  tenantId  String
+  actorId   String?
+  action    String
+  metadata  Json?
+  createdAt DateTime @default(now())
+
+  tenant Tenant @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+
+  @@map("audit_log")
+}
