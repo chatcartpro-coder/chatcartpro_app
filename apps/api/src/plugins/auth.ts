@@ -1,8 +1,10 @@
 import type { FastifyInstance, FastifyRequest, FastifyReply } from "fastify";
-import { createHmac, timingSafeEqual } from "node:crypto";
+import { jwtVerify, createRemoteJWKSet } from "jose";
 import { prisma } from "@chatcartpro/db";
 
-const SUPABASE_JWT_SECRET = process.env.SUPABASE_JWT_SECRET ?? "";
+const SUPABASE_JWKS_URL = process.env.SUPABASE_JWKS_URL ?? "";
+
+const JWKS = createRemoteJWKSet(new URL(SUPABASE_JWKS_URL));
 
 declare module "fastify" {
   interface FastifyRequest {
@@ -10,36 +12,20 @@ declare module "fastify" {
   }
 }
 
-function base64UrlDecode(input: string): Buffer {
-  const padded = input.replace(/-/g, "+").replace(/_/g, "/").padEnd(input.length + ((4 - (input.length % 4)) % 4), "=");
-  return Buffer.from(padded, "base64");
-}
-
 /**
- * Verifies a Supabase-issued HS256 JWT locally against SUPABASE_JWT_SECRET
- * (found in Supabase project settings > API > JWT Secret). Avoids a network
- * round-trip per request, which matters for webhook-adjacent endpoints that
- * need to stay fast.
+ * Verifies a Supabase-issued JWT against the project's JWKS endpoint
+ * (ES256, asymmetric — Supabase's new API key system has no shared HMAC
+ * secret). jose caches and rotates keys internally so this doesn't cost
+ * a network round-trip per request.
  */
-function verifySupabaseJwt(token: string): { sub: string; exp: number } | null {
-  const parts = token.split(".");
-  if (parts.length !== 3) return null;
-  const [headerB64, payloadB64, signatureB64] = parts;
-
-  const expectedSig = createHmac("sha256", SUPABASE_JWT_SECRET)
-    .update(`${headerB64}.${payloadB64}`)
-    .digest();
-  const providedSig = base64UrlDecode(signatureB64);
-
-  if (expectedSig.length !== providedSig.length || !timingSafeEqual(expectedSig, providedSig)) {
+async function verifySupabaseJwt(token: string): Promise<{ sub: string } | null> {
+  try {
+    const { payload } = await jwtVerify(token, JWKS);
+    if (typeof payload.sub !== "string") return null;
+    return { sub: payload.sub };
+  } catch {
     return null;
   }
-
-  const payload = JSON.parse(base64UrlDecode(payloadB64).toString("utf8"));
-  if (typeof payload.exp === "number" && Date.now() / 1000 > payload.exp) {
-    return null; // expired
-  }
-  return { sub: payload.sub, exp: payload.exp };
 }
 
 /**
@@ -56,7 +42,7 @@ export async function authenticate(req: FastifyRequest, reply: FastifyReply) {
   }
 
   const token = authHeader.slice("Bearer ".length);
-  const claims = verifySupabaseJwt(token);
+  const claims = await verifySupabaseJwt(token);
   if (!claims) {
     return reply.code(401).send({ error: "Invalid or expired token" });
   }

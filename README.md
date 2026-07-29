@@ -47,9 +47,10 @@ Auth uses Supabase Auth. You need a Supabase project (free tier is fine):
    (or run against local Postgres for schema work, and Supabase only for auth — see note below).
 2. Copy the project's URL + anon key into `apps/web/.env` (`NEXT_PUBLIC_SUPABASE_URL`,
    `NEXT_PUBLIC_SUPABASE_ANON_KEY`).
-3. Copy the project's JWT secret (Settings > API > JWT Secret) into
-   `apps/api/.env` as `SUPABASE_JWT_SECRET` — the API verifies tokens locally
-   against this rather than calling Supabase per request.
+3. Copy the project's JWKS URL (`https://<project-ref>.supabase.co/auth/v1/.well-known/jwks.json`)
+   into `apps/api/.env` as `SUPABASE_JWKS_URL` — the API verifies tokens'
+   ES256 signatures against this, caching keys locally rather than calling
+   Supabase per request.
 4. Sign up at `/signup`, complete the industry/business-name form at
    `/onboarding` (creates your `Tenant` + `Plan` + `User` row), then land on
    `/dashboard`.
